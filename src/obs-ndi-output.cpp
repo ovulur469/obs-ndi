@@ -20,6 +20,7 @@ License along with this library. If not, see <https://www.gnu.org/licenses/>
 #include <util/platform.h>
 #include <util/threading.h>
 #include <util/profiler.h>
+#include <media-io/video-frame.h>
 
 #include "obs-ndi.h"
 
@@ -41,6 +42,17 @@ struct ndi_output {
 
     uint8_t* conv_buffer;
     uint32_t conv_linesize;
+
+    gs_texrender_t* texrender;
+    gs_stagesurf_t* stagesurface;
+
+    uint32_t videoWidth;
+    uint32_t videoHeight;
+    uint8_t* videoData;
+    uint32_t videoLinesize;
+
+    video_t* video_output;
+
 };
 
 const char* ndi_output_getname(void* data) {
@@ -62,13 +74,81 @@ obs_properties_t* ndi_output_getproperties(void* data) {
     return props;
 }
 
+void ndi_output_rawvideo(void* data, struct video_data* frame);
+
+void ndi_output_mainrender(void* data, uint32_t cx, uint32_t cy) {
+    struct ndi_output* o = static_cast<ndi_output*>(data);
+    obs_get_video_info(&o->video_info);
+
+    gs_texrender_end(o->texrender);
+
+    if (o->videoWidth != cx || o->videoHeight != cy) {
+        gs_stagesurface_unmap(o->stagesurface);
+        gs_stagesurface_destroy(o->stagesurface);
+
+        o->stagesurface =
+            gs_stagesurface_create(cx, cy, GS_BGRA);
+        gs_stagesurface_map(o->stagesurface,
+            &o->videoData, &o->videoLinesize);
+
+        video_output_info vi;
+        vi.format = VIDEO_FORMAT_BGRA;
+        vi.width = cx;
+        vi.height = cy;
+        vi.fps_den = o->video_info.fps_den;
+        vi.fps_num = o->video_info.fps_num;
+        vi.cache_size = 1;
+        vi.colorspace = VIDEO_CS_DEFAULT;
+        vi.range = VIDEO_RANGE_DEFAULT;
+        vi.name = obs_output_get_name(o->output);
+
+        video_output_close(o->video_output);
+        video_output_open(&o->video_output, &vi);
+        video_output_connect(o->video_output,
+            nullptr, ndi_output_rawvideo, o);
+
+        o->videoWidth = cx;
+        o->videoHeight = cy;
+    }
+
+    struct video_frame output_frame;
+    if (video_output_lock_frame(o->video_output,
+        &output_frame, 1, os_gettime_ns()))
+    {
+        gs_stage_texture(o->stagesurface,
+            gs_texrender_get_texture(o->texrender));
+
+        memcpy(output_frame.data[0], o->videoData,
+            o->videoLinesize * o->videoHeight);
+        output_frame.linesize[0] = o->videoLinesize;
+
+        video_output_unlock_frame(o->video_output);
+    }
+
+    gs_blend_state_pop();
+
+    /* --- BREAK --- */
+
+    gs_texrender_reset(o->texrender);
+
+    gs_blend_state_push();
+    gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+
+    gs_texrender_begin(o->texrender, cx, cy);
+
+    struct vec4 background;
+    vec4_zero(&background);
+
+    gs_clear(GS_CLEAR_COLOR, &background, 0.0f, 0);
+    gs_ortho(0.0f, (float)cx, 0.0f, (float)cy, -100.0f, 100.0f);
+}
+
 bool ndi_output_start(void* data) {
     struct ndi_output* o = static_cast<ndi_output*>(data);
 
     ndiLib->NDIlib_send_destroy(o->ndi_sender);
     delete o->conv_buffer;
 
-    obs_get_video_info(&o->video_info);
     obs_get_audio_info(&o->audio_info);
 
     switch (o->video_info.output_format) {
@@ -107,7 +187,10 @@ bool ndi_output_start(void* data) {
 
     if (o->ndi_sender) {
         o->started = true;
-        obs_output_begin_data_capture(o->output, 0);
+        //obs_output_begin_data_capture(o->output, 0);
+
+        o->frame_format = NDIlib_FourCC_type_BGRA;
+        obs_add_main_render_callback(ndi_output_mainrender, o);
 
         if (o->async_sending) {
             blog(LOG_INFO, "asynchronous video sending enabled");
@@ -124,7 +207,12 @@ bool ndi_output_start(void* data) {
 void ndi_output_stop(void* data, uint64_t ts) {
     struct ndi_output* o = static_cast<ndi_output*>(data);
     o->started = false;
-    obs_output_end_data_capture(o->output);
+
+    //obs_output_end_data_capture(o->output);
+    obs_remove_main_render_callback(ndi_output_mainrender, o);
+
+    ndiLib->NDIlib_send_destroy(o->ndi_sender);
+    delete o->conv_buffer;
 }
 
 void ndi_output_update(void* data, obs_data_t* settings) {
@@ -140,6 +228,11 @@ void* ndi_output_create(obs_data_t* settings, obs_output_t* output) {
         static_cast<ndi_output*>(bzalloc(sizeof(struct ndi_output)));
     o->output = output;
     o->started = false;
+
+    o->videoWidth = 0;
+    o->videoHeight = 0;
+    o->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+
     ndi_output_update(o, settings);
 
     return o;
